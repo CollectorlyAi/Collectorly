@@ -26,11 +26,6 @@ pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 pyee==13.0.1
-pyobjc-core==12.2
-pyobjc-framework-Cocoa==12.2
-pyobjc-framework-CoreML==12.2
-pyobjc-framework-Quartz==12.2
-pyobjc-framework-Vision==12.2
 pypdfium2==5.9.0
 PySocks==1.7.1
 pytesseract==0.3.13
