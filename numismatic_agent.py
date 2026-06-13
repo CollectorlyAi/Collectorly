@@ -10,8 +10,14 @@ Dependencies:
     pip install requests beautifulsoup4
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext
+    TK_OK = True
+except (ImportError, RuntimeError):
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
+    TK_OK = False
 import threading
 import queue
 import re

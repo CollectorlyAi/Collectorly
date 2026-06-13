@@ -1,0 +1,219 @@
+/* ── Collectorly Numismatics — Web UI ─────────────────────────────────────── */
+
+:root {
+  --gold: #c9a227;
+  --gold-dark: #a07d10;
+  --banner-bg: #1a1a2e;
+  --card-border: #dee2e6;
+}
+
+body {
+  background: #f0f2f5;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  margin: 0;
+}
+
+/* ── Banner ── */
+.prices-banner {
+  background: var(--banner-bg);
+  color: #fff;
+  padding: 10px 16px;
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  box-shadow: 0 2px 8px rgba(0,0,0,.4);
+}
+
+.banner-title {
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--gold);
+  letter-spacing: .5px;
+  white-space: nowrap;
+}
+
+.price-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.2;
+}
+
+.price-chip .metal-name {
+  font-size: .65rem;
+  text-transform: uppercase;
+  color: #aaa;
+  letter-spacing: 1px;
+}
+
+.price-chip .metal-val {
+  font-size: .95rem;
+  font-weight: 600;
+  color: var(--gold);
+}
+
+/* ── Main layout ── */
+.main-content {
+  padding: 0 16px 32px;
+}
+
+/* ── Tabs ── */
+.nav-tabs .nav-link {
+  color: #555;
+  border: none;
+  border-bottom: 3px solid transparent;
+  background: none;
+  padding: 8px 16px;
+  font-size: .9rem;
+}
+
+.nav-tabs .nav-link:hover {
+  color: var(--gold-dark);
+}
+
+.nav-tabs .nav-link.active {
+  color: var(--gold-dark);
+  border-bottom-color: var(--gold);
+  background: none;
+  font-weight: 600;
+}
+
+.tab-content-panel {
+  display: none;
+}
+
+.tab-content-panel.active {
+  display: block;
+}
+
+/* ── Drop zone ── */
+.drop-zone {
+  border: 2px dashed #ccc;
+  border-radius: 12px;
+  padding: 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  background: #fafafa;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.drop-zone:hover, .drop-zone.drag-over {
+  border-color: var(--gold);
+  background: #fffbf0;
+}
+
+.drop-zone img {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+/* ── ID fields grid ── */
+.id-field {
+  background: #f8f9fa;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.id-field .label {
+  font-size: .7rem;
+  text-transform: uppercase;
+  color: #888;
+  letter-spacing: .5px;
+  margin-bottom: 2px;
+}
+
+.id-field .value {
+  font-size: .95rem;
+  font-weight: 500;
+}
+
+/* ── Tables ── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .88rem;
+}
+
+.data-table th {
+  background: #f0f2f5;
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 2px solid #ddd;
+}
+
+.data-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid #eee;
+}
+
+.data-table tr:hover td {
+  background: #fffbf0;
+}
+
+/* ── Cards ── */
+.card {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06);
+}
+
+.card-header {
+  background: #fff;
+  border-bottom: 1px solid #eee;
+  border-radius: 10px 10px 0 0 !important;
+  padding: 12px 16px;
+}
+
+/* ── Confidence badge colors ── */
+.badge-high   { background: #198754; }
+.badge-medium { background: #fd7e14; }
+.badge-low    { background: #dc3545; }
+
+/* ── Scrollable table container ── */
+.table-scroll {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ── Login overlay ── */
+#login-overlay {
+  position: fixed;
+  inset: 0;
+  background: linear-gradient(135deg, #1a1a2e, #16213e);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-box {
+  background: #fff;
+  border-radius: 16px;
+  padding: 40px;
+  width: 100%;
+  max-width: 400px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.3);
+}
+
+.login-box .logo-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--gold-dark);
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+.login-box .logo-sub {
+  text-align: center;
+  color: #888;
+  font-size: .85rem;
+  margin-bottom: 28px;
+}

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Collectorly — Sign In</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <link href="/static/css/style.css" rel="stylesheet">
+</head>
+<body>
+<div id="login-overlay">
+  <div class="login-box">
+    <div class="logo-title"><i class="bi bi-gem me-2"></i>Collectorly</div>
+    <div class="logo-sub">Numismatic Intelligence Platform</div>
+
+    {% if needs_setup %}
+    <div class="alert alert-info alert-sm mb-3 py-2 small">
+      <i class="bi bi-info-circle me-1"></i>
+      First launch — create a master password to protect your credential vault.
+    </div>
+    {% endif %}
+
+    <div id="login-error" class="alert alert-danger d-none py-2 small" role="alert"></div>
+
+    <form id="login-form" onsubmit="doLogin(event)">
+      <div class="mb-3">
+        <label class="form-label fw-semibold">
+          {% if needs_setup %}Create Master Password{% else %}Master Password{% endif %}
+        </label>
+        <div class="input-group">
+          <input type="password" id="pw-input" class="form-control" autofocus
+                 placeholder="{% if needs_setup %}Min 8 characters{% else %}Enter password{% endif %}"
+                 autocomplete="{% if needs_setup %}new-password{% else %}current-password{% endif %}">
+          <button type="button" class="btn btn-outline-secondary" onclick="togglePw()">
+            <i class="bi bi-eye" id="eye-icon"></i>
+          </button>
+        </div>
+      </div>
+
+      {% if needs_setup %}
+      <div class="mb-4">
+        <label class="form-label fw-semibold">Confirm Password</label>
+        <input type="password" id="pw-confirm" class="form-control" placeholder="Repeat password">
+      </div>
+      {% endif %}
+
+      <div class="d-grid">
+        <button type="submit" class="btn btn-primary" id="btn-login">
+          <span id="login-spinner" class="spinner-border spinner-border-sm me-2 d-none"></span>
+          {% if needs_setup %}Create Vault &amp; Sign In{% else %}Sign In{% endif %}
+        </button>
+      </div>
+    </form>
+
+    <p class="text-center text-muted mt-3 mb-0 small">
+      <i class="bi bi-shield-lock me-1"></i>
+      All credentials are encrypted at rest (AES-128 Fernet).
+    </p>
+  </div>
+</div>
+
+<script>
+  const needsSetup = {{ 'true' if needs_setup else 'false' }};
+
+  function togglePw() {
+    const inp = document.getElementById('pw-input');
+    const icon = document.getElementById('eye-icon');
+    if (inp.type === 'password') {
+      inp.type = 'text';
+      icon.className = 'bi bi-eye-slash';
+    } else {
+      inp.type = 'password';
+      icon.className = 'bi bi-eye';
+    }
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('login-error');
+    el.textContent = msg;
+    el.classList.remove('d-none');
+  }
+
+  async function doLogin(e) {
+    e.preventDefault();
+    const pw = document.getElementById('pw-input').value;
+    const btn = document.getElementById('btn-login');
+    const spin = document.getElementById('login-spinner');
+    const err = document.getElementById('login-error');
+    err.classList.add('d-none');
+
+    if (needsSetup) {
+      const pw2 = document.getElementById('pw-confirm').value;
+      if (pw !== pw2) { showError('Passwords do not match.'); return; }
+      if (pw.length < 8) { showError('Password must be at least 8 characters.'); return; }
+    }
+
+    btn.disabled = true;
+    spin.classList.remove('d-none');
+
+    try {
+      const res = await fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        window.location.href = '/';
+      } else {
+        showError(data.error || 'Login failed.');
+        btn.disabled = false;
+        spin.classList.add('d-none');
+      }
+    } catch (ex) {
+      showError('Network error. Please try again.');
+      btn.disabled = false;
+      spin.classList.add('d-none');
+    }
+  }
+</script>
+</body>
+</html>

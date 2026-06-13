@@ -20,8 +20,10 @@ env/
 # App data / credentials (never commit these)
 credentials.enc
 credentials.json
+web_auth.json
 *.enc
 world_coins.db
+uploads/
 
 # Logs
 *.log
