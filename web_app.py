@@ -664,6 +664,63 @@ def api_delete_credentials(site):
         return _json_error(str(exc), 500)
 
 
+@app.route("/api/image-proxy")
+@login_required
+def api_image_proxy():
+    """Fetch a coin image server-side and stream it back.
+    Bypasses Referer/hotlink restrictions that block direct browser requests
+    to NGC and PCGS image CDNs.
+    """
+    url = request.args.get("url", "").strip()
+    if not url or not url.startswith("http"):
+        return _json_error("Invalid URL", 400)
+
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower()
+    ALLOWED_DOMAINS = (
+        "ngccoin.com", "images.ngccoin.com",
+        "pcgs.com", "pcgsimages.com",
+        "cloudfront.net",
+    )
+    if not any(d in domain for d in ALLOWED_DOMAINS):
+        return _json_error("Image domain not allowed", 403)
+
+    try:
+        import requests as _req
+        referer = (
+            "https://www.ngccoin.com/"
+            if "ngc" in domain
+            else "https://www.pcgs.com/"
+        )
+        r = _req.get(
+            url,
+            timeout=15,
+            headers={
+                "Referer": referer,
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+            stream=True,
+        )
+        content_type = r.headers.get("Content-Type", "image/jpeg")
+        return (
+            r.content,
+            r.status_code,
+            {
+                "Content-Type": content_type,
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as exc:
+        log.warning("image-proxy error for %s: %s", url, exc)
+        return _json_error(str(exc), 502)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

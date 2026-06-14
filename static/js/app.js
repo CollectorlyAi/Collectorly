@@ -426,12 +426,15 @@ function renderCertData(data) {
 
   let html = '';
 
-  // Coin images (obverse / reverse)
+  // Coin images (obverse / reverse) — proxied server-side to bypass CDN hotlink blocks
   if (images.length) {
-    html += '<div class="d-flex gap-2 mb-3 flex-wrap">';
+    html += '<div class="d-flex gap-2 mb-3 flex-wrap" id="cert-images-row">';
     images.forEach((src, i) => {
-      html += `<img src="${escHtml(src)}" alt="${i === 0 ? 'Obverse' : 'Reverse'}"
-                    class="cert-coin-img rounded" title="${i === 0 ? 'Obverse' : 'Reverse'}">`;
+      const proxied = '/api/image-proxy?url=' + encodeURIComponent(src);
+      const label   = i === 0 ? 'Obverse' : 'Reverse';
+      html += `<img src="${proxied}" alt="${label}"
+                    class="cert-coin-img rounded" title="${label}"
+                    onerror="this.style.display='none'">`;
     });
     html += '</div>';
   }

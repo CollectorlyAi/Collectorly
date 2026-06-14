@@ -2310,14 +2310,79 @@ class NGCCertFetcher:
 
     @classmethod
     async def _extract_images(cls, page) -> List[str]:
+        # Scroll to trigger lazy-loaded images then scroll back
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await page.wait_for_timeout(1000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        try:
+            raw = await page.evaluate("""() => {
+                const ATTRS = ['src','data-src','data-lazy','data-lazy-src',
+                               'data-original','data-image','ng-src'];
+                const NGC_DOMAINS = ['ngccoin.com','ngc-image','numisproxy','coinimages',
+                                     'ngccert','certimages'];
+                const seen = new Set();
+                const urls = [];
+                const base = 'https://www.ngccoin.com';
+
+                function norm(u) {
+                    if (!u) return '';
+                    u = u.trim().split(' ')[0];  // handle srcset fragments
+                    if (u.startsWith('//')) return 'https:' + u;
+                    if (u.startsWith('/')) return base + u;
+                    return u;
+                }
+                function push(u) {
+                    if (u && u.startsWith('http') && !seen.has(u)) {
+                        seen.add(u); urls.push(u);
+                    }
+                }
+
+                // Priority: known coin-image selectors
+                const COIN_SELS = [
+                    '[class*="cert-image"] img', '[class*="coin-image"] img',
+                    '.obverse img', '.reverse img', '[class*="certlookup"] img',
+                    '[class*="cert-detail"] img', '[class*="ngc-cert"] img',
+                    'img[alt*="obverse" i]', 'img[alt*="reverse" i]',
+                ];
+                for (const sel of COIN_SELS) {
+                    for (const img of document.querySelectorAll(sel)) {
+                        for (const attr of ATTRS) push(norm(img.getAttribute(attr)));
+                    }
+                }
+
+                // Fallback: any img on an NGC domain
+                if (urls.length < 2) {
+                    for (const img of document.querySelectorAll('img')) {
+                        for (const attr of ATTRS) {
+                            const u = norm(img.getAttribute(attr));
+                            if (u && NGC_DOMAINS.some(d => u.includes(d))) push(u);
+                        }
+                    }
+                }
+                return urls.slice(0, 4);
+            }""")
+            if raw:
+                return raw
+        except Exception:
+            pass
+
+        # Last-resort: attribute-by-attribute locator scan
         urls: List[str] = []
         for sel in ["[class*='cert-image'] img", "[class*='coin-image'] img",
                     ".obverse img", ".reverse img", ".certlookup img"]:
             try:
                 for el in await page.locator(sel).all():
-                    src = await el.get_attribute("src") or ""
-                    if src and src.startswith("http") and src not in urls:
-                        urls.append(src)
+                    for attr in ["src", "data-src", "data-lazy", "ng-src"]:
+                        raw_src = await el.get_attribute(attr) or ""
+                        if raw_src.startswith("//"):
+                            raw_src = "https:" + raw_src
+                        if raw_src and raw_src.startswith("http") and raw_src not in urls:
+                            urls.append(raw_src)
             except Exception:
                 pass
         return urls[:4]
@@ -2560,15 +2625,81 @@ class PCGSCertFetcher:
 
     @classmethod
     async def _extract_images(cls, page) -> List[str]:
+        # Scroll to trigger lazy-loaded images then scroll back
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            await page.wait_for_timeout(1000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        try:
+            raw = await page.evaluate("""() => {
+                const ATTRS = ['src','data-src','data-lazy','data-lazy-src',
+                               'data-original','data-image','data-img'];
+                const PCGS_DOMAINS = ['pcgsimages.com','pcgs.com','cloudfront.net',
+                                      'certimages','coinimages','pcgscert'];
+                const seen = new Set();
+                const urls = [];
+                const base = 'https://www.pcgs.com';
+
+                function norm(u) {
+                    if (!u) return '';
+                    u = u.trim().split(' ')[0];
+                    if (u.startsWith('//')) return 'https:' + u;
+                    if (u.startsWith('/')) return base + u;
+                    return u;
+                }
+                function push(u) {
+                    if (u && u.startsWith('http') && !seen.has(u)) {
+                        seen.add(u); urls.push(u);
+                    }
+                }
+
+                const COIN_SELS = [
+                    '[class*="CertImage"] img', '[class*="cert-image"] img',
+                    '[class*="CoinImage"] img', '[class*="obverse"] img',
+                    '[class*="reverse"] img',   '[class*="coin-photo"] img',
+                    '[class*="CoinPhoto"] img', '[class*="certPhoto"] img',
+                    'img[alt*="obverse" i]', 'img[alt*="reverse" i]',
+                    'img[alt*="cert" i]',
+                ];
+                for (const sel of COIN_SELS) {
+                    for (const img of document.querySelectorAll(sel)) {
+                        for (const attr of ATTRS) push(norm(img.getAttribute(attr)));
+                    }
+                }
+
+                // Fallback: any img from a PCGS image domain
+                if (urls.length < 2) {
+                    for (const img of document.querySelectorAll('img')) {
+                        for (const attr of ATTRS) {
+                            const u = norm(img.getAttribute(attr));
+                            if (u && PCGS_DOMAINS.some(d => u.includes(d))) push(u);
+                        }
+                    }
+                }
+                return urls.slice(0, 4);
+            }""")
+            if raw:
+                return raw
+        except Exception:
+            pass
+
+        # Last-resort: attribute-by-attribute locator scan
         urls: List[str] = []
         for sel in ["[class*='CertImage'] img", "[class*='cert-image'] img",
                     "[class*='CoinImage'] img", "[class*='obverse'] img",
                     "[class*='reverse'] img",   "[class*='coin-photo'] img"]:
             try:
                 for el in await page.locator(sel).all():
-                    src = await el.get_attribute("src") or ""
-                    if src and src.startswith("http") and src not in urls:
-                        urls.append(src)
+                    for attr in ["src", "data-src", "data-lazy", "data-original"]:
+                        raw_src = await el.get_attribute(attr) or ""
+                        if raw_src.startswith("//"):
+                            raw_src = "https:" + raw_src
+                        if raw_src and raw_src.startswith("http") and raw_src not in urls:
+                            urls.append(raw_src)
             except Exception:
                 pass
         return urls[:4]
