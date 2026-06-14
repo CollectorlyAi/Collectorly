@@ -132,6 +132,7 @@ except (ImportError, RuntimeError):
     ttk          = _TtkModule()  # type: ignore
     messagebox   = _MsgboxModule()  # type: ignore
     scrolledtext = _ScrolledModule()  # type: ignore
+import asyncio
 import threading
 import queue
 import re
@@ -768,6 +769,113 @@ class PlaywrightLoginManager:
                 pass
             cls._browser = None
             cls._pw = None
+
+
+# ── PlaywrightRunner ──────────────────────────────────────────────────────────
+
+class PlaywrightRunner:
+    """
+    All Playwright work runs on one dedicated asyncio event-loop thread.
+    Callers on any thread submit coroutines via run() and block for the result.
+    This avoids every thread-switching error in the sync Playwright API.
+    """
+    _loop:   Optional[asyncio.AbstractEventLoop] = None
+    _thread: Optional[threading.Thread]          = None
+    _browser  = None  # async_api.Browser
+    _apw      = None  # AsyncPlaywright instance
+    _lock     = threading.Lock()
+
+    _STEALTH_JS = """
+        Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+        Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+        Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+        Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>8});
+        Object.defineProperty(screen,'colorDepth',{get:()=>24});
+        window.chrome={runtime:{},loadTimes:function(){},csi:function(){},app:{}};
+        const _origPQ=window.navigator.permissions.query;
+        window.navigator.permissions.query=(p)=>
+            p.name==='notifications'
+            ?Promise.resolve({state:Notification.permission})
+            :_origPQ(p);
+    """
+    _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/124.0.0.0 Safari/537.36")
+
+    # ── loop management ───────────────────────────────────────────────────────
+
+    @classmethod
+    def _start(cls) -> asyncio.AbstractEventLoop:
+        with cls._lock:
+            if cls._loop and cls._loop.is_running():
+                return cls._loop
+            loop = asyncio.new_event_loop()
+            cls._loop = loop
+            t = threading.Thread(target=loop.run_forever,
+                                 daemon=True, name="pw-async-loop")
+            t.start()
+            cls._thread = t
+            return loop
+
+    @classmethod
+    def run(cls, coro, timeout: int = 120):
+        """Submit coroutine to the async loop and block until result."""
+        return asyncio.run_coroutine_threadsafe(coro, cls._start()).result(timeout)
+
+    # ── browser / context helpers ─────────────────────────────────────────────
+
+    @classmethod
+    async def _get_browser(cls):
+        if cls._browser is None or not cls._browser.is_connected():
+            from playwright.async_api import async_playwright as _apw_fn
+            cls._apw    = await _apw_fn().__aenter__()
+            cls._browser = await cls._apw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-gpu", "--disable-setuid-sandbox"],
+            )
+        return cls._browser
+
+    @classmethod
+    async def new_context(cls):
+        browser = await cls._get_browser()
+        return await browser.new_context(
+            user_agent=cls._UA, locale="en-US",
+            timezone_id="America/New_York",
+            viewport={"width": 1280, "height": 900},
+            java_script_enabled=True,
+        )
+
+    @classmethod
+    async def stealth_page(cls, ctx=None):
+        """Return (page, ctx). Creates context if not supplied."""
+        if ctx is None:
+            ctx = await cls.new_context()
+        page = await ctx.new_page()
+        await page.add_init_script(cls._STEALTH_JS)
+        return page, ctx
+
+    # ── shutdown ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def shutdown(cls):
+        async def _close():
+            try:
+                if cls._browser:
+                    await cls._browser.close()
+                if cls._apw:
+                    await cls._apw.__aexit__(None, None, None)
+            except Exception:
+                pass
+            finally:
+                cls._browser = None
+                cls._apw     = None
+        if cls._loop and cls._loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(_close(), cls._loop).result(10)
+            except Exception:
+                pass
 
 
 def _auto_login(session: "requests.Session", site_key: str,
@@ -2039,72 +2147,455 @@ class PCGSPriceFetcher:
 
 
 class NGCCertFetcher:
+    """
+    Looks up an NGC certificate number using async Playwright (headless Chromium).
+    NGC's cert page is Angular-rendered — plain requests returns an empty shell.
+    Falls back to requests+BeautifulSoup if Playwright is unavailable.
+    """
+    _BASE_URL  = "https://www.ngccoin.com/certlookup/"
+    _NAV_WAIT  = 2500   # ms after navigation before scraping
+
     @classmethod
     def fetch(cls, cert: str) -> Dict:
-        url = f"https://www.ngccoin.com/certlookup/{quote_plus(cert)}/"
+        cert = cert.strip()
+        url  = f"{cls._BASE_URL}{quote_plus(cert)}/"
+        if not cert:
+            return {"url": url, "cert": cert, "data": {}, "error": "Cert number required"}
+        if PLAYWRIGHT_OK:
+            try:
+                return PlaywrightRunner.run(cls._fetch_async(cert), timeout=90)
+            except Exception as e:
+                log.warning("NGCCertFetcher playwright failed: %s — falling back", e)
+        # Fallback: plain HTTP (works only if NGC ever serves static HTML)
+        return cls._fetch_requests(cert, url)
+
+    @classmethod
+    async def _fetch_async(cls, cert: str) -> Dict:
+        url = f"{cls._BASE_URL}{quote_plus(cert)}/"
+        ctx = None
+        try:
+            page, ctx = await PlaywrightRunner.stealth_page()
+
+            # Navigate and wait for Angular to render
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(cls._NAV_WAIT)
+
+            # Wait for cert data or "not found" message
+            for ready_sel in [
+                ".certlookup-result", ".cert-lookup-result",
+                ".ngc-cert-detail",   "[class*='cert-result']",
+                ".no-results",        "[class*='not-found']",
+                "h1",                 ".cert-lookup",
+            ]:
+                try:
+                    await page.wait_for_selector(ready_sel, timeout=5000)
+                    break
+                except Exception:
+                    pass
+
+            await page.wait_for_timeout(500)
+            data = await cls._extract(page)
+            images = await cls._extract_images(page)
+            await ctx.close()
+
+            return {
+                "url":    url,
+                "cert":   cert,
+                "data":   data,
+                "images": images,
+                "error":  "" if data else "No certificate data found — verify the cert number",
+            }
+        except Exception as e:
+            log.warning("NGCCertFetcher._fetch_async: %s", e)
+            if ctx:
+                try: await ctx.close()
+                except Exception: pass
+            return {"url": url, "cert": cert, "data": {}, "images": [], "error": str(e)}
+
+    @classmethod
+    async def _extract(cls, page) -> Dict[str, str]:
+        data: Dict[str, str] = {}
+
+        # Strategy 1 — named field selectors (NGC uses Angular binding names)
+        field_map = {
+            "Coin":          [".certlookup-coin-name", ".cert-coin-name",
+                              "h1.coin-name",          "[class*='coinName']",
+                              "[class*='coin-name']",  ".ngc-coin"],
+            "Grade":         [".certlookup-grade",     ".cert-grade",
+                              "[class*='gradeValue']", "[class*='grade-label']",
+                              ".grade",                "[class*='certGrade']"],
+            "Grade Modifier":["[class*='gradeModifier']", "[class*='grade-modifier']",
+                              ".cert-designation",     "[class*='designation']"],
+            "Year":          ["[class*='yearValue']",  "[class*='cert-year']",
+                              ".cert-date",            "[class*='coinYear']"],
+            "Mint":          ["[class*='mintMark']",   "[class*='mint-mark']",
+                              ".cert-mint",            "[class*='mint']"],
+            "Denomination":  ["[class*='denomination']",".cert-denom"],
+            "Description":   ["[class*='coinDesc']",   ".cert-description",
+                              "[class*='description']"],
+            "Variety":       ["[class*='variety']",    ".cert-variety"],
+            "Pop at Grade":  ["[class*='popGrade']",   ".pop-grade",
+                              "[class*='popAtGrade']", "[class*='certPop']"],
+            "Pop Finer":     ["[class*='popFiner']",   ".pop-finer"],
+            "Cert #":        ["[class*='certNumber']", ".cert-number",
+                              "[class*='cert-num']"],
+        }
+        for label, selectors in field_map.items():
+            for sel in selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        txt = (await el.inner_text()).strip()
+                        if txt and txt.lower() not in ("", "n/a", "--"):
+                            data[label] = txt
+                            break
+                except Exception:
+                    pass
+
+        # Strategy 2 — <dl><dt>/<dd> pairs (common in Angular detail views)
+        if len(data) < 3:
+            try:
+                dts = await page.locator("dt").all()
+                for dt in dts:
+                    try:
+                        key = (await dt.inner_text()).strip().rstrip(":")
+                        dd  = page.locator(f"dt:has-text('{key}') + dd")
+                        if await dd.count() > 0:
+                            val = (await dd.first.inner_text()).strip()
+                            if key and val:
+                                data.setdefault(key, val)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Strategy 3 — generic label/value pairs inside result containers
+        if len(data) < 3:
+            try:
+                container = page.locator(
+                    ".certlookup-result, .cert-lookup-result, "
+                    ".ngc-cert-detail, [class*='cert-result'], "
+                    "[class*='certlookup']"
+                ).first
+                if await container.count() > 0:
+                    for row in await container.locator(
+                        "[class*='label'], [class*='field'], span, p, li"
+                    ).all():
+                        try:
+                            txt = (await row.inner_text()).strip()
+                            if ":" in txt:
+                                k, _, v = txt.partition(":")
+                                k, v = k.strip(), v.strip()
+                                if k and v and len(k) < 50:
+                                    data.setdefault(k, v)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Strategy 4 — regex over full page text (last resort)
+        if len(data) < 2:
+            try:
+                body = (await page.locator("body").inner_text()).strip()
+                for m in re.finditer(
+                    r"(Cert(?:ificate)?[#\s]*No\.?|Grade|Year|Mint|Denomination|"
+                    r"Variety|Population|Description)\s*[:\-]\s*([^\n\r]{1,80})",
+                    body, re.I
+                ):
+                    data.setdefault(m.group(1).strip(), m.group(2).strip())
+            except Exception:
+                pass
+
+        return data
+
+    @classmethod
+    async def _extract_images(cls, page) -> List[str]:
+        urls: List[str] = []
+        for sel in ["[class*='cert-image'] img", "[class*='coin-image'] img",
+                    ".obverse img", ".reverse img", ".certlookup img"]:
+            try:
+                for el in await page.locator(sel).all():
+                    src = await el.get_attribute("src") or ""
+                    if src and src.startswith("http") and src not in urls:
+                        urls.append(src)
+            except Exception:
+                pass
+        return urls[:4]
+
+    @classmethod
+    def _fetch_requests(cls, cert: str, url: str) -> Dict:
         if not REQUESTS_OK:
-            return {"url": url, "cert": cert, "data": {}, "error": "requests not installed"}
+            return {"url": url, "cert": cert, "data": {}, "images": [],
+                    "error": "requests not installed"}
         try:
             resp = _retry_get(url, "NGC Cert")
             data: Dict[str, str] = {}
-            try:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Key-value rows
-                for row in soup.select("tr, .cert-detail, [class*='cert-row'], [class*='detail-row']"):
-                    cells = row.find_all(["td", "th"])
-                    if len(cells) >= 2:
-                        label = cells[0].get_text(strip=True).rstrip(":")
-                        value = cells[1].get_text(strip=True)
-                        if label and value:
-                            data[label] = value
-                # Definition lists (dt/dd pattern)
-                for dt in soup.find_all("dt"):
-                    dd = dt.find_next_sibling("dd")
-                    if dd:
-                        data[dt.get_text(strip=True).rstrip(":")] = dd.get_text(strip=True)
-                # Labelled spans / divs
-                for el in soup.select("[class*='label'], [class*='field-label']"):
-                    val_el = el.find_next_sibling()
-                    if val_el:
-                        data[el.get_text(strip=True).rstrip(":")] = val_el.get_text(strip=True)
-            except Exception as e:
-                log.warning("NGC cert parse: %s", e)
-            return {"url": url, "cert": cert, "data": data, "error": ""}
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for row in soup.select("tr, [class*='cert-row'], [class*='detail-row']"):
+                cells = row.find_all(["td", "th"])
+                if len(cells) >= 2:
+                    k = cells[0].get_text(strip=True).rstrip(":")
+                    v = cells[1].get_text(strip=True)
+                    if k and v:
+                        data[k] = v
+            for dt in soup.find_all("dt"):
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    data[dt.get_text(strip=True).rstrip(":")] = dd.get_text(strip=True)
+            return {"url": url, "cert": cert, "data": data, "images": [], "error": ""}
         except FetchError as e:
-            return {"url": url, "cert": cert, "data": {}, "error": str(e)}
+            return {"url": url, "cert": cert, "data": {}, "images": [], "error": str(e)}
 
 
 class PCGSCertFetcher:
+    """
+    Looks up a PCGS certificate number using async Playwright.
+    PCGS cert pages are React-rendered — requests returns an empty shell.
+    Falls back to requests+BeautifulSoup if Playwright is unavailable.
+    """
+    _BASE_URL = "https://www.pcgs.com/cert/"
+    _API_URL  = "https://www.pcgs.com/api/cert/"   # JSON API (if available)
+    _NAV_WAIT = 3000   # ms — React hydration is slower than Angular
+
     @classmethod
     def fetch(cls, cert: str) -> Dict:
-        url = f"https://www.pcgs.com/cert/{quote_plus(cert)}"
+        cert = cert.strip()
+        url  = f"{cls._BASE_URL}{quote_plus(cert)}"
+        if not cert:
+            return {"url": url, "cert": cert, "data": {}, "error": "Cert number required"}
+        if PLAYWRIGHT_OK:
+            try:
+                return PlaywrightRunner.run(cls._fetch_async(cert), timeout=90)
+            except Exception as e:
+                log.warning("PCGSCertFetcher playwright failed: %s — falling back", e)
+        return cls._fetch_requests(cert, url)
+
+    @classmethod
+    async def _fetch_async(cls, cert: str) -> Dict:
+        url = f"{cls._BASE_URL}{quote_plus(cert)}"
+        ctx = None
+        try:
+            page, ctx = await PlaywrightRunner.stealth_page()
+
+            # Intercept XHR/fetch responses to grab JSON cert data directly
+            json_cert: Dict = {}
+            async def _on_response(resp):
+                nonlocal json_cert
+                if not json_cert and "pcgs.com" in resp.url and resp.status == 200:
+                    if any(k in resp.url for k in ("/cert/", "/api/", "/certlookup")):
+                        try:
+                            ct = resp.headers.get("content-type", "")
+                            if "json" in ct:
+                                body = await resp.json()
+                                if isinstance(body, dict) and (
+                                    body.get("coinName") or body.get("grade") or
+                                    body.get("certNumber") or body.get("coinDetail")
+                                ):
+                                    json_cert = body
+                        except Exception:
+                            pass
+            page.on("response", _on_response)
+
+            await page.goto(url, wait_until="networkidle", timeout=35000)
+            await page.wait_for_timeout(cls._NAV_WAIT)
+
+            # Wait for React hydration
+            for ready_sel in [
+                "[class*='CertDetail']", "[class*='cert-detail']",
+                "[class*='CoinDetail']", "[class*='pcgs-cert']",
+                ".cert-info",            ".coin-info",
+                "h1",                    "[class*='grade']",
+                "[class*='notFound']",   ".not-found",
+            ]:
+                try:
+                    await page.wait_for_selector(ready_sel, timeout=5000)
+                    break
+                except Exception:
+                    pass
+
+            await page.wait_for_timeout(500)
+
+            # Prefer JSON intercepted from XHR
+            data = cls._parse_json_cert(json_cert) if json_cert else {}
+
+            # Scrape DOM if JSON didn't give us enough
+            if len(data) < 3:
+                data = await cls._extract(page)
+
+            images = await cls._extract_images(page)
+            await ctx.close()
+
+            return {
+                "url":    url,
+                "cert":   cert,
+                "data":   data,
+                "images": images,
+                "error":  "" if data else "No certificate data found — verify the cert number",
+            }
+        except Exception as e:
+            log.warning("PCGSCertFetcher._fetch_async: %s", e)
+            if ctx:
+                try: await ctx.close()
+                except Exception: pass
+            return {"url": url, "cert": cert, "data": {}, "images": [], "error": str(e)}
+
+    @classmethod
+    def _parse_json_cert(cls, body: dict) -> Dict[str, str]:
+        """Parse JSON cert API response into a flat label→value dict."""
+        detail = body.get("coinDetail") or body
+        def g(*keys):
+            for k in keys:
+                v = detail.get(k)
+                if v and str(v).strip() not in ("", "0", "None"):
+                    return str(v).strip()
+            return ""
+        data: Dict[str, str] = {}
+        for label, keys in [
+            ("Coin",          ["coinName",   "name",       "title"]),
+            ("Year",          ["year",       "coinYear",   "date"]),
+            ("Mint",          ["mintMark",   "mint",       "mintCity"]),
+            ("Denomination",  ["denomination","denom"]),
+            ("Grade",         ["grade",      "gradeText",  "certGrade"]),
+            ("Designation",   ["designation","gradeModifier"]),
+            ("Variety",       ["variety",    "varietyName"]),
+            ("Mintage",       ["mintage",    "totalMintage"]),
+            ("Pop at Grade",  ["popGrade",   "popAtGrade", "gradePopulation"]),
+            ("Pop Finer",     ["popFiner",   "finerPopulation"]),
+            ("Price Guide",   ["priceGuide", "gradePrice", "value"]),
+            ("Cert #",        ["certNumber", "certNo",     "serialNumber"]),
+            ("Description",   ["description","coinDescription"]),
+        ]:
+            v = g(*keys)
+            if v:
+                data[label] = v
+        return data
+
+    @classmethod
+    async def _extract(cls, page) -> Dict[str, str]:
+        data: Dict[str, str] = {}
+
+        # Strategy 1 — PCGS-specific React class selectors
+        field_map = {
+            "Coin":         ["[class*='CoinName']",   "[class*='coin-name']",
+                             "h1",                    "[class*='coinName']"],
+            "Grade":        ["[class*='Grade']:not([class*='Pop']):not([class*='Price'])",
+                             "[class*='gradeText']",  ".grade-label",
+                             "[class*='certGrade']"],
+            "Designation":  ["[class*='Designation']","[class*='designation']",
+                             "[class*='gradeModifier']"],
+            "Year":         ["[class*='Year']",        "[class*='coinYear']",
+                             "[class*='year']"],
+            "Mint":         ["[class*='MintMark']",   "[class*='mint-mark']",
+                             "[class*='mintMark']"],
+            "Denomination": ["[class*='Denomination']","[class*='denom']"],
+            "Variety":      ["[class*='Variety']",    "[class*='variety']"],
+            "Mintage":      ["[class*='Mintage']",    "[class*='mintage']"],
+            "Pop at Grade": ["[class*='PopGrade']",   "[class*='popAtGrade']",
+                             "[class*='pop-grade']"],
+            "Pop Finer":    ["[class*='PopFiner']",   "[class*='pop-finer']"],
+            "Price Guide":  ["[class*='PriceGuide']", "[class*='price-guide']",
+                             "[class*='gradePrice']"],
+            "Cert #":       ["[class*='CertNumber']", "[class*='cert-number']",
+                             "[class*='certNumber']"],
+        }
+        for label, selectors in field_map.items():
+            for sel in selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        txt = (await el.inner_text()).strip()
+                        if txt and txt.lower() not in ("", "n/a", "--", "0"):
+                            data[label] = txt
+                            break
+                except Exception:
+                    pass
+
+        # Strategy 2 — <dl><dt>/<dd> pairs
+        if len(data) < 3:
+            try:
+                for dt in await page.locator("dt").all():
+                    try:
+                        key = (await dt.inner_text()).strip().rstrip(":")
+                        dd  = page.locator(f"dt:has-text('{key}') + dd")
+                        if await dd.count() > 0:
+                            val = (await dd.first.inner_text()).strip()
+                            if key and val:
+                                data.setdefault(key, val)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Strategy 3 — table rows inside cert container
+        if len(data) < 3:
+            try:
+                for row in await page.locator("table tr").all():
+                    try:
+                        cells = await row.locator("td, th").all()
+                        if len(cells) >= 2:
+                            k = (await cells[0].inner_text()).strip().rstrip(":")
+                            v = (await cells[1].inner_text()).strip()
+                            if k and v and len(k) < 60:
+                                data.setdefault(k, v)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Strategy 4 — regex over page body text
+        if len(data) < 2:
+            try:
+                body = (await page.locator("body").inner_text()).strip()
+                for m in re.finditer(
+                    r"(Cert(?:ificate)?[#\s]*No\.?|Grade|Year|Mint(?:\s*Mark)?|"
+                    r"Denomination|Variety|Mintage|Population|Price\s*Guide|"
+                    r"Designation)\s*[:\-]\s*([^\n\r]{1,80})",
+                    body, re.I
+                ):
+                    data.setdefault(m.group(1).strip(), m.group(2).strip())
+            except Exception:
+                pass
+
+        return data
+
+    @classmethod
+    async def _extract_images(cls, page) -> List[str]:
+        urls: List[str] = []
+        for sel in ["[class*='CertImage'] img", "[class*='cert-image'] img",
+                    "[class*='CoinImage'] img", "[class*='obverse'] img",
+                    "[class*='reverse'] img",   "[class*='coin-photo'] img"]:
+            try:
+                for el in await page.locator(sel).all():
+                    src = await el.get_attribute("src") or ""
+                    if src and src.startswith("http") and src not in urls:
+                        urls.append(src)
+            except Exception:
+                pass
+        return urls[:4]
+
+    @classmethod
+    def _fetch_requests(cls, cert: str, url: str) -> Dict:
         if not REQUESTS_OK:
-            return {"url": url, "cert": cert, "data": {}, "error": "requests not installed"}
+            return {"url": url, "cert": cert, "data": {}, "images": [],
+                    "error": "requests not installed"}
         try:
             resp = _retry_get(url, "PCGS Cert")
             data: Dict[str, str] = {}
-            try:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for row in soup.select("tr, .cert-detail, [class*='cert'], [class*='detail']"):
-                    cells = row.find_all(["td", "th"])
-                    if len(cells) >= 2:
-                        label = cells[0].get_text(strip=True).rstrip(":")
-                        value = cells[1].get_text(strip=True)
-                        if label and value:
-                            data[label] = value
-                for dt in soup.find_all("dt"):
-                    dd = dt.find_next_sibling("dd")
-                    if dd:
-                        data[dt.get_text(strip=True).rstrip(":")] = dd.get_text(strip=True)
-                for el in soup.select("[class*='label'], .field-name"):
-                    val_el = el.find_next_sibling()
-                    if val_el:
-                        data[el.get_text(strip=True).rstrip(":")] = val_el.get_text(strip=True)
-            except Exception as e:
-                log.warning("PCGS cert parse: %s", e)
-            return {"url": url, "cert": cert, "data": data, "error": ""}
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for row in soup.select("tr, [class*='cert'], [class*='detail']"):
+                cells = row.find_all(["td", "th"])
+                if len(cells) >= 2:
+                    k = cells[0].get_text(strip=True).rstrip(":")
+                    v = cells[1].get_text(strip=True)
+                    if k and v:
+                        data[k] = v
+            for dt in soup.find_all("dt"):
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    data[dt.get_text(strip=True).rstrip(":")] = dd.get_text(strip=True)
+            return {"url": url, "cert": cert, "data": data, "images": [], "error": ""}
         except FetchError as e:
-            return {"url": url, "cert": cert, "data": {}, "error": str(e)}
+            return {"url": url, "cert": cert, "data": {}, "images": [], "error": str(e)}
 
 
 class LotDetailFetcher:

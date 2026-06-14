@@ -183,6 +183,16 @@ body {
   overflow-y: auto;
 }
 
+/* ── Cert coin images ── */
+.cert-coin-img {
+  max-width: 180px;
+  max-height: 180px;
+  object-fit: contain;
+  background: #f8f9fa;
+  border: 1px solid #ddd;
+  padding: 4px;
+}
+
 /* ── Login overlay ── */
 #login-overlay {
   position: fixed;

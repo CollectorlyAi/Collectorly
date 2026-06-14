@@ -394,9 +394,11 @@ async function fetchPCGSCert() {
 async function _doCertFetch(url, title) {
   const cert = document.getElementById('cert-number').value.trim();
   if (!cert) { showToast('Cert number required', 'error'); return; }
+
   document.getElementById('cert-results').classList.add('d-none');
   document.getElementById('cert-loading').classList.remove('d-none');
   document.getElementById('cert-result-title').textContent = title + ' — ' + cert;
+
   try {
     const res  = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -404,23 +406,76 @@ async function _doCertFetch(url, title) {
     });
     const data = await res.json();
     document.getElementById('cert-loading').classList.add('d-none');
-    const body = document.getElementById('cert-body');
-    if (data.error && !Object.keys(data.data || {}).length) {
-      body.innerHTML = `<div class="alert alert-warning mb-0">${escHtml(data.error)}</div>`;
-    } else {
-      const entries = Object.entries(data.data || {});
-      body.innerHTML = entries.length
-        ? `<table class="data-table"><tbody>${entries.map(([k, v]) => `<tr><td class="fw-semibold">${escHtml(k)}</td><td>${escHtml(String(v))}</td></tr>`).join('')}</tbody></table>`
-        : '<p class="text-muted mb-0">No details returned.</p>';
-    }
-    if (data.url) {
-      body.insertAdjacentHTML('afterbegin', `<a href="${escHtml(data.url)}" target="_blank" class="btn btn-sm btn-outline-secondary mb-3"><i class="bi bi-box-arrow-up-right me-1"></i>View on site</a>`);
-    }
+    document.getElementById('cert-body').innerHTML = renderCertData(data);
     document.getElementById('cert-results').classList.remove('d-none');
   } catch (e) {
     document.getElementById('cert-loading').classList.add('d-none');
-    showToast('Error: ' + e.message, 'error');
+    showToast('Network error: ' + e.message, 'error');
   }
+}
+
+function renderCertData(data) {
+  const fields  = data.data   || {};
+  const images  = data.images || [];
+  const hasData = Object.keys(fields).length > 0;
+
+  // Error with no data
+  if (data.error && !hasData) {
+    return `<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i>${escHtml(data.error)}</div>`;
+  }
+
+  let html = '';
+
+  // Coin images (obverse / reverse)
+  if (images.length) {
+    html += '<div class="d-flex gap-2 mb-3 flex-wrap">';
+    images.forEach((src, i) => {
+      html += `<img src="${escHtml(src)}" alt="${i === 0 ? 'Obverse' : 'Reverse'}"
+                    class="cert-coin-img rounded" title="${i === 0 ? 'Obverse' : 'Reverse'}">`;
+    });
+    html += '</div>';
+  }
+
+  // "View on site" link
+  if (data.url) {
+    html += `<a href="${escHtml(data.url)}" target="_blank"
+               class="btn btn-sm btn-outline-secondary mb-3">
+               <i class="bi bi-box-arrow-up-right me-1"></i>View on site</a> `;
+  }
+
+  // Soft error (partial data returned)
+  if (data.error && hasData) {
+    html += `<div class="alert alert-warning py-1 small mb-2">${escHtml(data.error)}</div>`;
+  }
+
+  // Highlight key fields in chips
+  const highlights = ['Coin','Grade','Year','Mint','Designation','Variety','Pop at Grade','Pop Finer','Price Guide'];
+  const chips = highlights.filter(k => fields[k]);
+  if (chips.length) {
+    html += '<div class="d-flex gap-2 flex-wrap mb-3">';
+    chips.forEach(k => {
+      html += `<div class="id-field"><div class="label">${escHtml(k)}</div>
+                <div class="value">${escHtml(fields[k])}</div></div>`;
+    });
+    html += '</div>';
+  }
+
+  // Full data table
+  if (hasData) {
+    const rest = Object.entries(fields).filter(([k]) => !chips.includes(k));
+    if (rest.length) {
+      html += `<table class="data-table"><tbody>${
+        rest.map(([k, v]) =>
+          `<tr><td class="fw-semibold" style="width:38%">${escHtml(k)}</td>
+               <td>${escHtml(String(v))}</td></tr>`
+        ).join('')
+      }</tbody></table>`;
+    }
+  } else {
+    html += '<p class="text-muted mb-0">No details returned.</p>';
+  }
+
+  return html;
 }
 
 // ── Credentials modal ─────────────────────────────────────────────────────────
