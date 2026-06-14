@@ -11,6 +11,7 @@ import json
 import tempfile
 import logging
 import secrets
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 
@@ -58,11 +59,25 @@ except Exception as exc:
 
 # ── Flask setup ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.config["SECRET_KEY"]               = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"]       = 16 * 1024 * 1024   # 16 MB
-app.config["SESSION_COOKIE_HTTPONLY"]  = True
-app.config["SESSION_COOKIE_SAMESITE"]  = "Lax"
-app.config["SESSION_COOKIE_SECURE"]    = os.environ.get("RENDER") == "true"  # HTTPS on Render
+
+# SECRET_KEY must be stable across restarts or all sessions are invalidated.
+# On Render: set SECRET_KEY as a secret environment variable.
+# Locally: a random fallback is fine (sessions don't need to survive restarts).
+_SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+if not _SECRET_KEY:
+    # Derive a stable key from the machine if env var is missing.
+    # This survives process restarts on the same machine but not deploys.
+    import hashlib, socket, uuid as _uuid
+    _SECRET_KEY = hashlib.sha256(
+        socket.gethostname().encode() + str(_uuid.getnode()).encode() + b"numis_web_v1"
+    ).hexdigest()
+
+app.config["SECRET_KEY"]              = _SECRET_KEY
+app.config["MAX_CONTENT_LENGTH"]      = 16 * 1024 * 1024   # 16 MB
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"]   = bool(os.environ.get("RENDER"))  # HTTPS on Render
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "numis_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -71,8 +86,16 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
 
 
 # ── Master password store ─────────────────────────────────────────────────────
+#
+# Priority (first wins):
+#   1. APP_PASSWORD env var  — set this in Render's "Secret Files" or env vars.
+#      The app uses it directly; nothing is written to disk.
+#   2. web_auth.json file    — written on first-run setup, works on persistent
+#      disks or local installs. Wiped on Render's ephemeral filesystem.
+#
+# On Render free tier you MUST set APP_PASSWORD (and SECRET_KEY) as env vars.
 
-_AUTH_DIR  = Path(os.environ.get("HOME", Path.home())) / ".numismatic"
+_AUTH_DIR  = Path(os.environ.get("HOME", str(Path.home()))) / ".numismatic"
 _AUTH_FILE = _AUTH_DIR / "web_auth.json"
 
 
@@ -94,24 +117,22 @@ def _save_auth(data: dict):
         pass
 
 
-def _get_master_hash() -> str:
-    # Also allow APP_PASSWORD env var for Render (set it as a secret env var)
-    env_pw = os.environ.get("APP_PASSWORD", "")
-    if env_pw:
-        return generate_password_hash(env_pw)
-    return _load_auth().get("master_hash", "")
+def _env_password() -> str:
+    """Return APP_PASSWORD env var (stripped), or empty string."""
+    return os.environ.get("APP_PASSWORD", "").strip()
 
 
 def _has_master_password() -> bool:
-    if os.environ.get("APP_PASSWORD"):
+    if _env_password():
         return True
     return bool(_load_auth().get("master_hash"))
 
 
 def _check_password(password: str) -> bool:
-    env_pw = os.environ.get("APP_PASSWORD", "")
+    env_pw = _env_password()
     if env_pw:
-        return password == env_pw
+        # Timing-safe comparison to prevent timing attacks on plain-text env pw
+        return secrets.compare_digest(password.encode(), env_pw.encode())
     h = _load_auth().get("master_hash", "")
     if not h:
         return False
@@ -119,9 +140,47 @@ def _check_password(password: str) -> bool:
 
 
 def _set_master_password(password: str):
+    """Hash and persist password to disk (file-based mode only)."""
     data = _load_auth()
-    data["master_hash"] = generate_password_hash(password)
+    data["master_hash"] = generate_password_hash(password, method="pbkdf2:sha256")
     _save_auth(data)
+
+
+# ── Startup config check ──────────────────────────────────────────────────────
+
+def _log_startup_config():
+    on_render = bool(os.environ.get("RENDER"))
+    has_secret = bool(os.environ.get("SECRET_KEY"))
+    has_pw     = bool(_env_password())
+    has_file   = bool(_load_auth().get("master_hash"))
+
+    if on_render:
+        if not has_secret:
+            log.warning(
+                "SECRET_KEY env var not set — a random key is used, so ALL "
+                "sessions are invalidated on every Render restart. "
+                "Set SECRET_KEY to a fixed random string in Render environment."
+            )
+        if not has_pw:
+            if has_file:
+                log.warning(
+                    "APP_PASSWORD env var not set — password is stored in "
+                    "web_auth.json which is wiped on Render restarts. "
+                    "Set APP_PASSWORD in Render environment variables."
+                )
+            else:
+                log.warning(
+                    "No APP_PASSWORD env var and no web_auth.json. "
+                    "First-run setup will work but the password will be lost "
+                    "on the next Render restart. Set APP_PASSWORD now."
+                )
+    log.info(
+        "Auth config — env_password=%s file_hash=%s secret_key_fixed=%s",
+        bool(has_pw), has_file, has_secret,
+    )
+
+
+_log_startup_config()
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -188,12 +247,23 @@ def do_login():
         return _json_error("Password required", 400)
 
     if not _has_master_password():
+        # First-run: create master password
         if len(password) < 8:
             return _json_error("Password must be at least 8 characters", 400)
         _set_master_password(password)
         session["authenticated"] = True
         session.permanent = True
-        return jsonify({"ok": True, "setup": True})
+        on_render  = bool(os.environ.get("RENDER"))
+        ephemeral  = on_render and not _env_password()
+        return jsonify({
+            "ok":      True,
+            "setup":   True,
+            "warning": (
+                "Your password was saved to disk. On Render's free tier this "
+                "file is wiped on restarts. Set APP_PASSWORD in your Render "
+                "environment variables to make it permanent."
+            ) if ephemeral else None,
+        })
 
     if not _check_password(password):
         return _json_error("Incorrect password", 401)
@@ -209,6 +279,19 @@ def logout():
     return redirect(url_for("login_page"))
 
 
+@app.route("/api/auth/config")
+def api_auth_config():
+    """Public endpoint — tells the frontend what auth mode is active."""
+    return jsonify({
+        "needs_setup":    not _has_master_password(),
+        "env_password":   bool(_env_password()),
+        "file_password":  bool(_load_auth().get("master_hash")),
+        "render":         bool(os.environ.get("RENDER")),
+        "secret_key_env": bool(os.environ.get("SECRET_KEY")),
+        "authenticated":  bool(session.get("authenticated")),
+    })
+
+
 @app.route("/api/auth/change-password", methods=["POST"])
 @login_required
 def api_change_password():
@@ -219,6 +302,10 @@ def api_change_password():
         return _json_error("Current password incorrect", 401)
     if len(new_pw) < 8:
         return _json_error("New password must be at least 8 characters", 400)
+    if _env_password():
+        return _json_error(
+            "Password is set via APP_PASSWORD env var — change it there, not here.", 400
+        )
     _set_master_password(new_pw)
     return jsonify({"ok": True})
 

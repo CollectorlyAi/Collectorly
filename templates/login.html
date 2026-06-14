@@ -106,7 +106,14 @@
       });
       const data = await res.json();
       if (res.ok) {
-        window.location.href = '/';
+        if (data.warning) {
+          // Show warning briefly before redirect
+          showError('⚠ ' + data.warning);
+          err.className = 'alert alert-warning';
+          setTimeout(() => { window.location.href = '/'; }, 3500);
+        } else {
+          window.location.href = '/';
+        }
       } else {
         showError(data.error || 'Login failed.');
         btn.disabled = false;
