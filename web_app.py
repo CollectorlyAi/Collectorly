@@ -239,29 +239,27 @@ def _verify_reset_token(token: str) -> bool:
         return False
 
 
-def _send_reset_email(to_addr: str, reset_url: str) -> str:
-    """Send the password-reset email. Returns '' on success, error string on failure."""
+def _send_reset_email(to_addr: str, reset_url: str):
+    """
+    Send the password-reset email.
+    Raises RuntimeError on configuration problems, or re-raises SMTP exceptions.
+    """
     if not MAIL_OK:
-        return "flask-mail not installed (pip install flask-mail)"
+        raise RuntimeError("flask-mail not installed — run: pip install flask-mail")
     if not app.config.get("MAIL_USERNAME"):
-        return "Email not configured (set MAIL_USERNAME / MAIL_PASSWORD env vars)"
-    try:
-        msg = MailMessage(
-            subject="Collectorly — Password Reset",
-            recipients=[to_addr],
-            body=(
-                "You requested a password reset for your Collectorly account.\n\n"
-                f"Click the link below to set a new password (expires in 1 hour):\n\n"
-                f"  {reset_url}\n\n"
-                "If you did not request this, ignore this email — your password "
-                "has not been changed.\n"
-            ),
-        )
-        mail.send(msg)
-        return ""
-    except Exception as exc:
-        log.error("Reset email failed: %s", exc)
-        return str(exc)
+        raise RuntimeError("Email not configured — set MAIL_USERNAME and MAIL_PASSWORD env vars")
+    msg = MailMessage(
+        subject="Collectorly — Password Reset",
+        recipients=[to_addr],
+        body=(
+            "You requested a password reset for your Collectorly account.\n\n"
+            "Click the link below to set a new password (expires in 1 hour):\n\n"
+            f"  {reset_url}\n\n"
+            "If you did not request this, you can safely ignore this email.\n"
+            "Your password has not been changed.\n"
+        ),
+    )
+    mail.send(msg)   # raises on SMTP failure — caller handles it
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -397,7 +395,7 @@ def api_change_password():
 def forgot_password_page():
     if session.get("authenticated"):
         return redirect(url_for("index"))
-    mail_configured = bool(app.config.get("MAIL_USERNAME"))
+    mail_configured = MAIL_OK and bool(app.config.get("MAIL_USERNAME"))
     return render_template("forgot_password.html", mail_configured=mail_configured,
                            recovery_email_set=bool(_RECOVERY_EMAIL))
 
@@ -423,10 +421,15 @@ def api_forgot_password():
     if email_in and recovery and secrets.compare_digest(email_in, recovery):
         token     = _make_reset_token()
         reset_url = url_for("reset_password_page", token=token, _external=True)
-        err = _send_reset_email(_RECOVERY_EMAIL, reset_url)
-        if err:
-            log.error("Reset email error: %s", err)
-            # Don't leak the error to the browser
+        try:
+            _send_reset_email(_RECOVERY_EMAIL, reset_url)
+        except Exception as exc:
+            # Surface SMTP/config errors — these are admin problems, not user data leaks
+            log.error("Reset email failed: %s", exc)
+            return _json_error(
+                f"Failed to send reset email: {exc}. "
+                "Check MAIL_SERVER, MAIL_USERNAME, and MAIL_PASSWORD env vars.", 500
+            )
     else:
         log.info("Forgot-password: submitted email did not match recovery address")
 
