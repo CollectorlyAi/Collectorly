@@ -20,6 +20,15 @@ from flask import (
     session, redirect, url_for,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
+
+try:
+    from flask_mail import Mail, Message as MailMessage
+    MAIL_OK = True
+except ImportError:
+    MAIL_OK = False
+    log = logging.getLogger("web_app")
+    logging.getLogger("web_app").warning("flask-mail not installed; password reset emails disabled")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +87,26 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"]   = bool(os.environ.get("RENDER"))  # HTTPS on Render
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+
+# ── Flask-Mail (password reset) ───────────────────────────────────────────────
+# Gmail:   MAIL_SERVER=smtp.gmail.com  MAIL_PORT=587  MAIL_USERNAME=you@gmail.com
+#          MAIL_PASSWORD=<16-char App Password>  MAIL_DEFAULT_SENDER=you@gmail.com
+# SendGrid: MAIL_SERVER=smtp.sendgrid.net  MAIL_PORT=587
+#           MAIL_USERNAME=apikey  MAIL_PASSWORD=<SendGrid API key>
+app.config["MAIL_SERVER"]         = os.environ.get("MAIL_SERVER",  "smtp.gmail.com")
+app.config["MAIL_PORT"]           = int(os.environ.get("MAIL_PORT", "587"))
+app.config["MAIL_USE_TLS"]        = os.environ.get("MAIL_USE_TLS",  "true").lower() != "false"
+app.config["MAIL_USE_SSL"]        = os.environ.get("MAIL_USE_SSL",  "false").lower() == "true"
+app.config["MAIL_USERNAME"]       = os.environ.get("MAIL_USERNAME", "")
+app.config["MAIL_PASSWORD"]       = os.environ.get("MAIL_PASSWORD", "")
+app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_DEFAULT_SENDER",
+                                                    os.environ.get("MAIL_USERNAME", ""))
+# The email address that receives password-reset links (single-user app).
+# Set RECOVERY_EMAIL as an env var; falls back to MAIL_USERNAME.
+_RECOVERY_EMAIL = os.environ.get("RECOVERY_EMAIL",
+                                  os.environ.get("MAIL_USERNAME", "")).strip()
+
+mail = Mail(app) if MAIL_OK else None
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "numis_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -181,6 +210,58 @@ def _log_startup_config():
 
 
 _log_startup_config()
+
+
+# ── Password-reset tokens ─────────────────────────────────────────────────────
+
+_RESET_TOKEN_MAX_AGE = 3600  # seconds (1 hour)
+_RESET_SALT          = "pw-reset-salt-v1"
+
+
+def _make_reset_token() -> str:
+    """Generate a signed, time-limited reset token."""
+    s = URLSafeTimedSerializer(app.config["SECRET_KEY"])
+    # Bind the token to the current password hash so it's invalidated after
+    # a successful reset (old tokens can't be replayed).
+    extra_salt = _load_auth().get("master_hash", "") or _env_password()
+    return s.dumps("reset", salt=_RESET_SALT + extra_salt[:16])
+
+
+def _verify_reset_token(token: str) -> bool:
+    """Return True if the token is valid and not expired."""
+    s = URLSafeTimedSerializer(app.config["SECRET_KEY"])
+    extra_salt = _load_auth().get("master_hash", "") or _env_password()
+    try:
+        s.loads(token, salt=_RESET_SALT + extra_salt[:16],
+                max_age=_RESET_TOKEN_MAX_AGE)
+        return True
+    except (SignatureExpired, BadSignature):
+        return False
+
+
+def _send_reset_email(to_addr: str, reset_url: str) -> str:
+    """Send the password-reset email. Returns '' on success, error string on failure."""
+    if not MAIL_OK:
+        return "flask-mail not installed (pip install flask-mail)"
+    if not app.config.get("MAIL_USERNAME"):
+        return "Email not configured (set MAIL_USERNAME / MAIL_PASSWORD env vars)"
+    try:
+        msg = MailMessage(
+            subject="Collectorly — Password Reset",
+            recipients=[to_addr],
+            body=(
+                "You requested a password reset for your Collectorly account.\n\n"
+                f"Click the link below to set a new password (expires in 1 hour):\n\n"
+                f"  {reset_url}\n\n"
+                "If you did not request this, ignore this email — your password "
+                "has not been changed.\n"
+            ),
+        )
+        mail.send(msg)
+        return ""
+    except Exception as exc:
+        log.error("Reset email failed: %s", exc)
+        return str(exc)
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -307,6 +388,84 @@ def api_change_password():
             "Password is set via APP_PASSWORD env var — change it there, not here.", 400
         )
     _set_master_password(new_pw)
+    return jsonify({"ok": True})
+
+
+# ── Password-reset routes (public — no login required) ────────────────────────
+
+@app.route("/forgot-password", methods=["GET"])
+def forgot_password_page():
+    if session.get("authenticated"):
+        return redirect(url_for("index"))
+    mail_configured = bool(app.config.get("MAIL_USERNAME"))
+    return render_template("forgot_password.html", mail_configured=mail_configured,
+                           recovery_email_set=bool(_RECOVERY_EMAIL))
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def api_forgot_password():
+    """
+    Accepts a submitted email. If it matches RECOVERY_EMAIL (or MAIL_USERNAME),
+    generates a signed reset token and emails a link.
+    Always returns 200 to prevent email enumeration.
+    """
+    if not MAIL_OK or not app.config.get("MAIL_USERNAME"):
+        return _json_error(
+            "Email sending is not configured. "
+            "Set MAIL_USERNAME, MAIL_PASSWORD, and RECOVERY_EMAIL env vars.", 503
+        )
+
+    data     = request.get_json(force=True, silent=True) or {}
+    email_in = (data.get("email") or "").strip().lower()
+
+    # We always say "if email matches, check your inbox" — never confirm/deny
+    recovery = _RECOVERY_EMAIL.lower()
+    if email_in and recovery and secrets.compare_digest(email_in, recovery):
+        token     = _make_reset_token()
+        reset_url = url_for("reset_password_page", token=token, _external=True)
+        err = _send_reset_email(_RECOVERY_EMAIL, reset_url)
+        if err:
+            log.error("Reset email error: %s", err)
+            # Don't leak the error to the browser
+    else:
+        log.info("Forgot-password: submitted email did not match recovery address")
+
+    return jsonify({"ok": True, "message": "If that email is registered, you'll receive a reset link shortly."})
+
+
+@app.route("/reset-password/<token>", methods=["GET"])
+def reset_password_page(token: str):
+    if session.get("authenticated"):
+        return redirect(url_for("index"))
+    valid = _verify_reset_token(token)
+    return render_template("reset_password.html", token=token, valid=valid)
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def api_reset_password():
+    data     = request.get_json(force=True, silent=True) or {}
+    token    = (data.get("token")    or "").strip()
+    new_pw   = (data.get("password") or "")
+    confirm  = (data.get("confirm")  or "")
+
+    if not token:
+        return _json_error("Reset token missing", 400)
+    if not _verify_reset_token(token):
+        return _json_error("Reset link is invalid or has expired (links expire after 1 hour).", 400)
+    if len(new_pw) < 8:
+        return _json_error("Password must be at least 8 characters", 400)
+    if new_pw != confirm:
+        return _json_error("Passwords do not match", 400)
+    if _env_password():
+        return _json_error(
+            "Password is managed via APP_PASSWORD env var. "
+            "Update it in your Render environment settings.", 400
+        )
+
+    _set_master_password(new_pw)
+    # Invalidate the session so the user must log in with the new password
+    session.clear()
+    log.info("Password reset completed successfully")
     return jsonify({"ok": True})
 
 
