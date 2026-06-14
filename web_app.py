@@ -55,6 +55,8 @@ try:
         PCGSCertFetcher,
         WorldCoinDB,
         CredentialStore,
+        GreatCollectionsFetcher,
+        HeritageFetcher,
     )
     import numismatic_agent as _na
     ANTHROPIC_OK  = getattr(_na, "ANTHROPIC_OK",  False)
@@ -662,6 +664,222 @@ def api_delete_credentials(site):
         return jsonify({"ok": True})
     except Exception as exc:
         return _json_error(str(exc), 500)
+
+
+# ── Collection database ───────────────────────────────────────────────────────
+
+_COLLECTION_DB_PATH = _AUTH_DIR / "collection.db"
+
+_COLLECTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS collection (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cert_number     TEXT,
+    source          TEXT,
+    coin_name       TEXT,
+    grade           TEXT,
+    year            TEXT,
+    mint            TEXT,
+    designation     TEXT,
+    purchase_price  REAL,
+    current_value   REAL,
+    purchase_date   TEXT,
+    notes           TEXT,
+    image_url       TEXT,
+    cert_data       TEXT,
+    added_at        TEXT DEFAULT (datetime('now'))
+)
+"""
+
+
+def _col_db():
+    _AUTH_DIR.mkdir(parents=True, exist_ok=True)
+    conn = __import__("sqlite3").connect(str(_COLLECTION_DB_PATH))
+    conn.row_factory = __import__("sqlite3").Row
+    conn.execute(_COLLECTION_SCHEMA)
+    conn.commit()
+    return conn
+
+
+@app.route("/api/collection", methods=["GET"])
+@login_required
+def api_collection_list():
+    try:
+        conn = _col_db()
+        rows = conn.execute(
+            "SELECT * FROM collection ORDER BY added_at DESC"
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.route("/api/collection", methods=["POST"])
+@login_required
+def api_collection_add():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        conn = _col_db()
+        cur = conn.execute(
+            """INSERT INTO collection
+               (cert_number, source, coin_name, grade, year, mint,
+                designation, purchase_price, current_value,
+                purchase_date, notes, image_url, cert_data)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                data.get("cert_number"), data.get("source"),
+                data.get("coin_name"),   data.get("grade"),
+                data.get("year"),        data.get("mint"),
+                data.get("designation"),
+                data.get("purchase_price"), data.get("current_value"),
+                data.get("purchase_date"),  data.get("notes"),
+                data.get("image_url"),
+                json.dumps(data.get("cert_data") or {}),
+            ),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+        conn.close()
+        return jsonify({"ok": True, "id": new_id})
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.route("/api/collection/<int:item_id>", methods=["PUT"])
+@login_required
+def api_collection_update(item_id):
+    data = request.get_json(force=True, silent=True) or {}
+    allowed = {"purchase_price", "current_value", "notes", "purchase_date",
+               "coin_name", "grade", "year", "mint"}
+    updates = {k: data[k] for k in allowed if k in data}
+    if not updates:
+        return _json_error("No updatable fields", 400)
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    try:
+        conn = _col_db()
+        conn.execute(
+            f"UPDATE collection SET {set_clause} WHERE id=?",
+            list(updates.values()) + [item_id],
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.route("/api/collection/<int:item_id>", methods=["DELETE"])
+@login_required
+def api_collection_delete(item_id):
+    try:
+        conn = _col_db()
+        conn.execute("DELETE FROM collection WHERE id=?", (item_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.route("/api/collection/export-csv")
+@login_required
+def api_collection_export_csv():
+    import csv, io
+    try:
+        conn = _col_db()
+        rows = conn.execute(
+            "SELECT * FROM collection ORDER BY added_at DESC"
+        ).fetchall()
+        conn.close()
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["ID", "Source", "Cert#", "Coin", "Grade", "Year", "Mint",
+                    "Designation", "Purchase Price", "Current Value",
+                    "Purchase Date", "Notes", "Added"])
+        for r in rows:
+            w.writerow([r["id"], r["source"], r["cert_number"], r["coin_name"],
+                        r["grade"], r["year"], r["mint"], r["designation"],
+                        r["purchase_price"], r["current_value"],
+                        r["purchase_date"], r["notes"], r["added_at"]])
+        from flask import Response
+        return Response(
+            out.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=collection.csv"},
+        )
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+
+@app.route("/api/market-feed", methods=["POST"])
+@login_required
+def api_market_feed():
+    if not BACKEND_OK:
+        return _json_error("Backend unavailable", 503)
+    data  = request.get_json(force=True, silent=True) or {}
+    name  = (data.get("name")  or "").strip()
+    year  = (data.get("year")  or "").strip()
+    mint  = (data.get("mint")  or "").strip()
+    grade = (data.get("grade") or "").strip()
+    if not name:
+        return _json_error("name required", 400)
+
+    def _row(r):
+        return {
+            "source":      r.source,
+            "description": r.description,
+            "grade":       r.grade,
+            "holder":      r.holder,
+            "price":       r.price,
+            "date":        r.date,
+            "url":         r.url,
+        }
+
+    results = []
+    error   = ""
+    try:
+        for r in GreatCollectionsFetcher.search(name, year, mint, grade, ""):
+            results.append(_row(r))
+    except Exception as e:
+        error += f"GC: {e}  "
+        log.warning("market-feed GC: %s", e)
+    try:
+        for r in HeritageFetcher.search(name, year, mint, grade, ""):
+            results.append(_row(r))
+    except Exception as e:
+        error += f"Heritage: {e}"
+        log.warning("market-feed Heritage: %s", e)
+
+    results.sort(key=lambda r: r.get("date") or "", reverse=True)
+    return jsonify({"results": results[:40], "error": error.strip() or ""})
+
+
+@app.route("/api/ngc-vs-pcgs", methods=["POST"])
+@login_required
+def api_ngc_vs_pcgs():
+    if not BACKEND_OK:
+        return _json_error("Backend unavailable", 503)
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    year = (data.get("year") or "").strip()
+    mint = (data.get("mint") or "").strip()
+    if not name:
+        return _json_error("name required", 400)
+    try:
+        ngc  = NGCPopFetcher.fetch(name=name, year=year, mint=mint)
+    except Exception as e:
+        ngc  = {"error": str(e), "populations": {}}
+    try:
+        pcgs_pop    = PCGSPopFetcher.fetch(name=name, year=year, mint=mint)
+        pcgs_prices = PCGSPriceFetcher.fetch(name=name, year=year, mint=mint)
+    except Exception as e:
+        pcgs_pop    = {"error": str(e), "populations": {}}
+        pcgs_prices = {"error": str(e), "prices": {}}
+    return jsonify({
+        "name": name, "year": year, "mint": mint,
+        "ngc":  ngc,
+        "pcgs": {**pcgs_pop, "prices": pcgs_prices.get("prices", {})},
+    })
 
 
 @app.route("/api/image-proxy")

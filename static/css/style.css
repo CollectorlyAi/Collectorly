@@ -193,6 +193,42 @@ body {
   padding: 4px;
 }
 
+/* ── Collection cards ── */
+.coll-card {
+  border-radius: 10px;
+  overflow: hidden;
+  transition: box-shadow .15s;
+}
+.coll-card:hover {
+  box-shadow: 0 4px 16px rgba(0,0,0,.12);
+}
+.coll-card-img {
+  height: 140px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f8f9fa;
+  border-bottom: 1px solid #eee;
+  overflow: hidden;
+}
+.coll-card-img img {
+  max-height: 136px;
+  max-width: 100%;
+  object-fit: contain;
+}
+.coll-card-img--placeholder {
+  color: #ccc;
+}
+.btn-xs {
+  font-size: .75rem;
+  padding: 2px 8px;
+}
+
+/* ── Market feed rows ── */
+.mkt-row:last-child {
+  border-bottom: none !important;
+}
+
 /* ── Login overlay ── */
 #login-overlay {
   position: fixed;
