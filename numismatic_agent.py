@@ -658,12 +658,26 @@ class PlaywrightLoginManager:
     @classmethod
     def _ensure_browser(cls):
         if cls._browser is None:
-            cls._pw = _sync_playwright().start()
-            cls._browser = cls._pw.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled",
-                      "--no-sandbox", "--disable-dev-shm-usage"],
-            )
+            try:
+                cls._pw = _sync_playwright().start()
+                cls._browser = cls._pw.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox", "--disable-dev-shm-usage"],
+                )
+            except Exception:
+                # Clean up partial state so the next call can start fresh.
+                # If we leave cls._pw running but cls._browser=None, the next
+                # call's _sync_playwright().start() raises "Sync API inside
+                # asyncio loop" because the first instance's loop is still live.
+                try:
+                    if cls._pw:
+                        cls._pw.stop()
+                except Exception:
+                    pass
+                cls._pw = None
+                cls._browser = None
+                raise
         return cls._browser
 
     @classmethod
@@ -3198,6 +3212,10 @@ class WorldCoinDB:
         conn.row_factory = sqlite3.Row
         for stmt in _WORLD_DB_SCHEMA:
             conn.execute(stmt)
+        # Migrate: add columns that were added after initial schema
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(coins)").fetchall()}
+        if "page_number" not in existing:
+            conn.execute("ALTER TABLE coins ADD COLUMN page_number INTEGER DEFAULT 0")
         conn.commit()
         return conn
 
