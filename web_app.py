@@ -16,7 +16,7 @@ from pathlib import Path
 
 from flask import (
     Flask, render_template, request, jsonify,
-    session, redirect, url_for, abort,
+    session, redirect, url_for,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -26,12 +26,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("web_app")
 
-# Strip credentials from log records at the module level
-_SENSITIVE = {"password", "api_key", "token", "secret", "key", "pass"}
-_orig_make = logging.LogRecord.__init__
-
 # ── Import backend (tkinter-free) ─────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
+
+BACKEND_OK   = False
+ANTHROPIC_OK = False
+PLAYWRIGHT_OK = False
+PIL_OK        = False
 
 try:
     from numismatic_agent import (
@@ -44,31 +45,34 @@ try:
         PCGSCertFetcher,
         WorldCoinDB,
         CredentialStore,
-        ANTHROPIC_OK,
-        PLAYWRIGHT_OK,
-        PIL_OK,
     )
-    # Verify key classes loaded
-    _ = MetalPriceFetcher.fetch  # noqa: attribute check
-    BACKEND_OK = True
-except Exception as e:
-    log.error("Backend import failed: %s", e)
-    BACKEND_OK = False
+    import numismatic_agent as _na
+    ANTHROPIC_OK  = getattr(_na, "ANTHROPIC_OK",  False)
+    PLAYWRIGHT_OK = getattr(_na, "PLAYWRIGHT_OK", False)
+    PIL_OK        = getattr(_na, "PIL_OK",         False)
+    BACKEND_OK    = True
+    log.info("Backend loaded OK (anthropic=%s playwright=%s pil=%s)",
+             ANTHROPIC_OK, PLAYWRIGHT_OK, PIL_OK)
+except Exception as exc:
+    log.error("Backend import failed: %s", exc, exc_info=True)
 
 # ── Flask setup ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SECRET_KEY"]               = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"]       = 16 * 1024 * 1024   # 16 MB
+app.config["SESSION_COOKIE_HTTPONLY"]  = True
+app.config["SESSION_COOKIE_SAMESITE"]  = "Lax"
+app.config["SESSION_COOKIE_SECURE"]    = os.environ.get("RENDER") == "true"  # HTTPS on Render
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "numis_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
 
+
 # ── Master password store ─────────────────────────────────────────────────────
-_AUTH_DIR  = Path.home() / ".numismatic"
+
+_AUTH_DIR  = Path(os.environ.get("HOME", Path.home())) / ".numismatic"
 _AUTH_FILE = _AUTH_DIR / "web_auth.json"
 
 
@@ -82,7 +86,7 @@ def _load_auth() -> dict:
 
 
 def _save_auth(data: dict):
-    _AUTH_DIR.mkdir(exist_ok=True)
+    _AUTH_DIR.mkdir(parents=True, exist_ok=True)
     _AUTH_FILE.write_text(json.dumps(data))
     try:
         _AUTH_FILE.chmod(0o600)
@@ -91,7 +95,27 @@ def _save_auth(data: dict):
 
 
 def _get_master_hash() -> str:
+    # Also allow APP_PASSWORD env var for Render (set it as a secret env var)
+    env_pw = os.environ.get("APP_PASSWORD", "")
+    if env_pw:
+        return generate_password_hash(env_pw)
     return _load_auth().get("master_hash", "")
+
+
+def _has_master_password() -> bool:
+    if os.environ.get("APP_PASSWORD"):
+        return True
+    return bool(_load_auth().get("master_hash"))
+
+
+def _check_password(password: str) -> bool:
+    env_pw = os.environ.get("APP_PASSWORD", "")
+    if env_pw:
+        return password == env_pw
+    h = _load_auth().get("master_hash", "")
+    if not h:
+        return False
+    return check_password_hash(h, password)
 
 
 def _set_master_password(password: str):
@@ -100,25 +124,19 @@ def _set_master_password(password: str):
     _save_auth(data)
 
 
-def _has_master_password() -> bool:
-    return bool(_get_master_hash())
+# ── Auth helpers ──────────────────────────────────────────────────────────────
 
+def _json_error(message: str, status: int):
+    return jsonify({"error": message}), status
 
-def _check_password(password: str) -> bool:
-    h = _get_master_hash()
-    if not h:
-        return False
-    return check_password_hash(h, password)
-
-
-# ── Auth decorator ────────────────────────────────────────────────────────────
 
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get("authenticated"):
-            if request.is_json or request.path.startswith("/api/"):
-                abort(401)
+            # API calls always get JSON 401, never an HTML redirect
+            if request.path.startswith("/api/"):
+                return _json_error("Authentication required", 401)
             return redirect(url_for("login_page"))
         return f(*args, **kwargs)
     return decorated
@@ -126,6 +144,29 @@ def login_required(f):
 
 def _allowed(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# ── Error handlers ─────────────────────────────────────────────────────────────
+
+@app.errorhandler(413)
+def too_large(_e):
+    if request.path.startswith("/api/"):
+        return _json_error("File too large (max 16 MB)", 413)
+    return render_template("login.html", needs_setup=False), 413
+
+
+@app.errorhandler(404)
+def not_found(_e):
+    if request.path.startswith("/api/"):
+        return _json_error("Not found", 404)
+    return redirect(url_for("index"))
+
+
+@app.errorhandler(500)
+def server_error(_e):
+    if request.path.startswith("/api/"):
+        return _json_error("Internal server error", 500)
+    return redirect(url_for("index"))
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -140,23 +181,22 @@ def login_page():
 
 @app.route("/login", methods=["POST"])
 def do_login():
-    data = request.get_json(force=True, silent=True) or {}
+    data     = request.get_json(force=True, silent=True) or {}
     password = data.get("password", "")
 
     if not password:
-        return jsonify({"error": "Password required"}), 400
+        return _json_error("Password required", 400)
 
     if not _has_master_password():
-        # First-run: set the master password
         if len(password) < 8:
-            return jsonify({"error": "Password must be at least 8 characters"}), 400
+            return _json_error("Password must be at least 8 characters", 400)
         _set_master_password(password)
         session["authenticated"] = True
         session.permanent = True
         return jsonify({"ok": True, "setup": True})
 
     if not _check_password(password):
-        return jsonify({"error": "Incorrect password"}), 401
+        return _json_error("Incorrect password", 401)
 
     session["authenticated"] = True
     session.permanent = True
@@ -172,13 +212,13 @@ def logout():
 @app.route("/api/auth/change-password", methods=["POST"])
 @login_required
 def api_change_password():
-    data = request.get_json(force=True, silent=True) or {}
+    data    = request.get_json(force=True, silent=True) or {}
     current = data.get("current", "")
-    new_pw   = data.get("new", "")
+    new_pw  = data.get("new", "")
     if not _check_password(current):
-        return jsonify({"error": "Current password incorrect"}), 401
+        return _json_error("Current password incorrect", 401)
     if len(new_pw) < 8:
-        return jsonify({"error": "New password must be at least 8 characters"}), 400
+        return _json_error("New password must be at least 8 characters", 400)
     _set_master_password(new_pw)
     return jsonify({"ok": True})
 
@@ -196,9 +236,9 @@ def index():
 def api_status():
     return jsonify({
         "backend":    BACKEND_OK,
-        "playwright": PLAYWRIGHT_OK if BACKEND_OK else False,
-        "anthropic":  ANTHROPIC_OK  if BACKEND_OK else False,
-        "pil":        PIL_OK         if BACKEND_OK else False,
+        "playwright": PLAYWRIGHT_OK,
+        "anthropic":  ANTHROPIC_OK,
+        "pil":        PIL_OK,
     })
 
 
@@ -206,28 +246,28 @@ def api_status():
 @login_required
 def api_metal_prices():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     try:
         prices, err = MetalPriceFetcher.fetch()
         return jsonify({"prices": prices, "error": err})
-    except Exception as e:
-        log.exception("metal-prices error")
-        return jsonify({"prices": {}, "error": str(e)}), 500
+    except Exception as exc:
+        log.exception("metal-prices")
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/identify", methods=["POST"])
 @login_required
 def api_identify():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     if not ANTHROPIC_OK:
-        return jsonify({"error": "anthropic package not installed"}), 500
+        return _json_error("anthropic package not installed — run: pip install anthropic", 500)
 
     file = request.files.get("image")
-    if not file or file.filename == "":
-        return jsonify({"error": "No image uploaded"}), 400
+    if not file or not file.filename:
+        return _json_error("No image uploaded", 400)
     if not _allowed(file.filename):
-        return jsonify({"error": "Unsupported file type"}), 400
+        return _json_error("Unsupported file type", 400)
 
     suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
     tmp = tempfile.NamedTemporaryFile(dir=UPLOAD_DIR, suffix=suffix, delete=False)
@@ -236,8 +276,8 @@ def api_identify():
         result = CoinVisionIdentifier.identify(tmp.name)
 
         catalog_matches = []
-        km      = result.get("km_number", "").strip()
-        country = result.get("country", "").strip()
+        km      = (result.get("km_number") or "").strip()
+        country = (result.get("country")   or "").strip()
         if km:
             try:
                 catalog_matches = WorldCoinDB.search_by_km(km, country=country, limit=5)
@@ -245,9 +285,9 @@ def api_identify():
                 pass
 
         return jsonify({"identification": result, "catalog_matches": catalog_matches})
-    except Exception as e:
-        log.exception("identify error")
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        log.exception("identify")
+        return _json_error(str(exc), 500)
     finally:
         try:
             os.unlink(tmp.name)
@@ -259,119 +299,120 @@ def api_identify():
 @login_required
 def api_ngc_census():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     data = request.get_json(force=True, silent=True) or {}
-    name = data.get("name", "").strip()
-    year = data.get("year", "").strip()
-    mint = data.get("mint", "").strip()
+    name = (data.get("name") or "").strip()
     if not name:
-        return jsonify({"error": "coin name required"}), 400
+        return _json_error("coin name required", 400)
     try:
-        result = NGCPopFetcher.fetch(name, year, mint)
-        return jsonify(result)
-    except Exception as e:
-        log.exception("ngc-census error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(NGCPopFetcher.fetch(
+            name,
+            (data.get("year") or "").strip(),
+            (data.get("mint") or "").strip(),
+        ))
+    except Exception as exc:
+        log.exception("ngc-census")
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/pcgs-pop", methods=["POST"])
 @login_required
 def api_pcgs_pop():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     data = request.get_json(force=True, silent=True) or {}
-    name = data.get("name", "").strip()
-    year = data.get("year", "").strip()
-    mint = data.get("mint", "").strip()
+    name = (data.get("name") or "").strip()
     if not name:
-        return jsonify({"error": "coin name required"}), 400
+        return _json_error("coin name required", 400)
     try:
-        result = PCGSPopFetcher.fetch(name, year, mint)
-        return jsonify(result)
-    except Exception as e:
-        log.exception("pcgs-pop error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(PCGSPopFetcher.fetch(
+            name,
+            (data.get("year") or "").strip(),
+            (data.get("mint") or "").strip(),
+        ))
+    except Exception as exc:
+        log.exception("pcgs-pop")
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/pcgs-prices", methods=["POST"])
 @login_required
 def api_pcgs_prices():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     data = request.get_json(force=True, silent=True) or {}
-    name = data.get("name", "").strip()
-    year = data.get("year", "").strip()
-    mint = data.get("mint", "").strip()
+    name = (data.get("name") or "").strip()
     if not name:
-        return jsonify({"error": "coin name required"}), 400
+        return _json_error("coin name required", 400)
     try:
-        result = PCGSPriceFetcher.fetch(name, year, mint)
-        return jsonify(result)
-    except Exception as e:
-        log.exception("pcgs-prices error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(PCGSPriceFetcher.fetch(
+            name,
+            (data.get("year") or "").strip(),
+            (data.get("mint") or "").strip(),
+        ))
+    except Exception as exc:
+        log.exception("pcgs-prices")
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/ngc-cert", methods=["POST"])
 @login_required
 def api_ngc_cert():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     data = request.get_json(force=True, silent=True) or {}
-    cert = data.get("cert", "").strip()
+    cert = (data.get("cert") or "").strip()
     if not cert:
-        return jsonify({"error": "cert number required"}), 400
+        return _json_error("cert number required", 400)
     try:
-        result = NGCCertFetcher.fetch(cert)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify(NGCCertFetcher.fetch(cert))
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/pcgs-cert", methods=["POST"])
 @login_required
 def api_pcgs_cert():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     data = request.get_json(force=True, silent=True) or {}
-    cert = data.get("cert", "").strip()
+    cert = (data.get("cert") or "").strip()
     if not cert:
-        return jsonify({"error": "cert number required"}), 400
+        return _json_error("cert number required", 400)
     try:
-        result = PCGSCertFetcher.fetch(cert)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify(PCGSCertFetcher.fetch(cert))
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/credentials", methods=["POST"])
 @login_required
 def api_save_credentials():
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
-    data = request.get_json(force=True, silent=True) or {}
-    site     = data.get("site", "").strip()
-    username = data.get("username", "").strip()
-    password = data.get("password", "").strip()
+        return _json_error("Backend unavailable", 503)
+    data     = request.get_json(force=True, silent=True) or {}
+    site     = (data.get("site")     or "").strip()
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
     if not site:
-        return jsonify({"error": "site required"}), 400
+        return _json_error("site required", 400)
     try:
         CredentialStore.save(site, username, password)
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @app.route("/api/credentials/<site>", methods=["DELETE"])
 @login_required
 def api_delete_credentials(site):
     if not BACKEND_OK:
-        return jsonify({"error": "Backend unavailable"}), 503
+        return _json_error("Backend unavailable", 503)
     try:
         CredentialStore.delete(site)
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

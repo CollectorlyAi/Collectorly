@@ -15,9 +15,123 @@ try:
     from tkinter import ttk, messagebox, scrolledtext
     TK_OK = True
 except (ImportError, RuntimeError):
-    tk = None  # type: ignore
-    ttk = None  # type: ignore
     TK_OK = False
+    # Stub out the entire tkinter namespace so GUI class definitions don't
+    # crash at import time when running headless (e.g. on Render/Linux).
+    class _Stub:
+        """Absorbs any attribute access and any call."""
+        def __init__(self, *a, **kw): pass
+        def __call__(self, *a, **kw): return self
+        def __getattr__(self, name): return self
+        def pack(self, *a, **kw): pass
+        def grid(self, *a, **kw): pass
+        def place(self, *a, **kw): pass
+        def config(self, *a, **kw): pass
+        def configure(self, *a, **kw): pass
+        def bind(self, *a, **kw): pass
+        def bind_all(self, *a, **kw): pass
+        def unbind_all(self, *a, **kw): pass
+        def insert(self, *a, **kw): pass
+        def delete(self, *a, **kw): pass
+        def get(self, *a, **kw): return ""
+        def set(self, *a, **kw): pass
+        def destroy(self, *a, **kw): pass
+        def title(self, *a, **kw): pass
+        def geometry(self, *a, **kw): pass
+        def resizable(self, *a, **kw): pass
+        def minsize(self, *a, **kw): pass
+        def transient(self, *a, **kw): pass
+        def grab_set(self, *a, **kw): pass
+        def update_idletasks(self, *a, **kw): pass
+        def winfo_screenwidth(self, *a, **kw): return 1920
+        def winfo_screenheight(self, *a, **kw): return 1080
+        def mainloop(self, *a, **kw): pass
+        def after(self, *a, **kw): pass
+        def protocol(self, *a, **kw): pass
+        def create_window(self, *a, **kw): return 0
+        def create_text(self, *a, **kw): return 0
+        def bbox(self, *a, **kw): return (0, 0, 0, 0)
+        def itemconfig(self, *a, **kw): pass
+        def yview_scroll(self, *a, **kw): pass
+        def tag_configure(self, *a, **kw): pass
+        def tag_add(self, *a, **kw): pass
+        def index(self, *a, **kw): return "1.0"
+        def see(self, *a, **kw): pass
+
+    class _TkModule:
+        """Mimics the tkinter module namespace."""
+        Tk       = _Stub
+        Toplevel = _Stub
+        Frame    = _Stub
+        LabelFrame = _Stub
+        Canvas   = _Stub
+        Label    = _Stub
+        Button   = _Stub
+        Entry    = _Stub
+        Text     = _Stub
+        Scrollbar = _Stub
+        StringVar = _Stub
+        BooleanVar = _Stub
+        IntVar   = _Stub
+        DoubleVar = _Stub
+        PhotoImage = _Stub
+        Menu     = _Stub
+        Menubutton = _Stub
+        OptionMenu = _Stub
+        Checkbutton = _Stub
+        Radiobutton = _Stub
+        Listbox  = _Stub
+        Scale    = _Stub
+        Spinbox  = _Stub
+        PanedWindow = _Stub
+        # Constants
+        END = "end"; X = "x"; Y = "y"; BOTH = "both"; N = "n"; S = "s"
+        E = "e"; W = "w"; NW = "nw"; NE = "ne"; SW = "sw"; SE = "se"
+        LEFT = "left"; RIGHT = "right"; TOP = "top"; BOTTOM = "bottom"
+        CENTER = "center"; FLAT = "flat"; WORD = "word"; CHAR = "char"
+        HORIZONTAL = "horizontal"; VERTICAL = "vertical"
+        NORMAL = "normal"; DISABLED = "disabled"; HIDDEN = "hidden"
+        RAISED = "raised"; SUNKEN = "sunken"; RIDGE = "ridge"; GROOVE = "groove"
+        SOLID = "solid"; ROUND = "round"; BUTT = "butt"
+        FIRST = "first"; LAST = "last"; NONE = "none"; ALL = "all"
+        INSERT = "insert"; SEL = "sel"; SEL_FIRST = "sel.first"; SEL_LAST = "sel.last"
+        ACTIVE = "active"; CURRENT = "current"
+        BROWSE = "browse"; MULTIPLE = "multiple"; EXTENDED = "extended"; SINGLE = "single"
+        READABLE = "readable"; WRITABLE = "writable"; EXCEPTION = "exception"
+        CASCADE = "cascade"; CHECKBUTTON = "checkbutton"; COMMAND = "command"
+        RADIOBUTTON = "radiobutton"; SEPARATOR = "separator"
+        TRUE = True; FALSE = False
+        def __getattr__(self, name): return _Stub()
+
+    class _TtkModule:
+        Button   = _Stub; Entry    = _Stub; Label    = _Stub; Frame    = _Stub
+        LabelFrame = _Stub; Combobox = _Stub; Scrollbar = _Stub; Treeview = _Stub
+        Notebook = _Stub; PanedWindow = _Stub; Scale   = _Stub; Spinbox  = _Stub
+        Progressbar = _Stub; Separator = _Stub; Sizegrip = _Stub
+        Style    = _Stub
+        def __getattr__(self, name): return _Stub()
+
+    class _MsgboxModule:
+        @staticmethod
+        def showinfo(*a, **kw): pass
+        @staticmethod
+        def showerror(*a, **kw): pass
+        @staticmethod
+        def showwarning(*a, **kw): pass
+        @staticmethod
+        def askyesno(*a, **kw): return False
+        @staticmethod
+        def askokcancel(*a, **kw): return False
+        @staticmethod
+        def askyesnocancel(*a, **kw): return False
+
+    class _ScrolledModule:
+        ScrolledText = _Stub
+
+    tk           = _TkModule()   # type: ignore
+    ttk          = _TtkModule()  # type: ignore
+    messagebox   = _MsgboxModule()  # type: ignore
+    scrolledtext = _ScrolledModule()  # type: ignore
 import threading
 import queue
 import re
